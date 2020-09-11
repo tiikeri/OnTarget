@@ -1,6 +1,9 @@
 #include "OnTarget.h"
+#include <iostream>
+#include <iomanip>
 
 BAKKESMOD_PLUGIN(OnTarget, "On Target", "1.0", PLUGINTYPE_CUSTOM_TRAINING)
+
 
 void OnTarget::onLoad()
 {
@@ -16,6 +19,12 @@ void OnTarget::onLoad()
 
 	cvarManager->registerCvar(titleBarSetting, "1").addOnValueChanged([this](string old, CVarWrapper now) {
 		titleBar = (now.getStringValue() == "1");
+
+		writeCfg();
+	});
+
+	cvarManager->registerCvar(toggleResetCountsAsMiss, "1").addOnValueChanged([this](string old, CVarWrapper now) {
+		doesResetCountAsMiss = (now.getStringValue() == "1");
 
 		writeCfg();
 	});
@@ -61,7 +70,7 @@ void OnTarget::onLoad()
 	}
 
 	else {
-		vector<string> settings = { "onTargetShotHistory", "onTargetTitleBar", "onTargetTransparency", goalHitColorSetting, multiTouchColorSetting, wallHitColorSetting };
+		vector<string> settings = { "onTargetShotHistory", "onTargetResetMiss", "onTargetTitleBar", "onTargetTransparency", goalHitColorSetting, multiTouchColorSetting, wallHitColorSetting };
 
 		for (string& setting : settings) {
 			cvarManager->getCvar(setting).notify();
@@ -75,7 +84,7 @@ void OnTarget::onLoad()
 	gameWrapper->HookEvent("Function TAGame.GameEvent_TrainingEditor_TA.OnResetRoundConfirm", bind(&OnTarget::clearShotsResetCounts, this, placeholders::_1));
 	gameWrapper->HookEvent("Function TAGame.GameEvent_TrainingEditor_TA.IncrementRound", bind(&OnTarget::clearShotsResetCounts, this, placeholders::_1));
 	gameWrapper->HookEvent("Function TAGame.GameEvent_TrainingEditor_TA.Load", bind(&OnTarget::clearShotsResetCounts, this, placeholders::_1));
-
+	gameWrapper->HookEvent("Function TAGame.GameInfo_GameEditor_TA.PlayerResetTraining", bind(&OnTarget::onNewAttempt, this, placeholders::_1));
 	gameWrapper->HookEventWithCaller<BallWrapper>("Function TAGame.Ball_TA.EventHitWorld", std::bind(&OnTarget::onHitWorld, this, placeholders::_1, placeholders::_2, placeholders::_3));
 	gameWrapper->HookEventWithCaller<BallWrapper>("Function TAGame.Ball_TA.EventHitGoal", std::bind(&OnTarget::onHitGoal, this, placeholders::_1, placeholders::_2, placeholders::_3));
 }
@@ -133,10 +142,29 @@ ImColor OnTarget::stringToImColor(string colorString)
 	return NULL;
 }
 
+ImColor OnTarget::colorScale(float Val) {
+	stringstream buf;
+	int rVal = round(Val);
+	if (rVal - 60 <= 25) {
+		if (rVal <= 60) { return stringToImColor("255,0,0"); }
+		buf << "255," << round(((float)rVal - 60.0) * 10.2) << ",0";
+		return stringToImColor(buf.str());
+	}
+	else if (rVal - 60 > 25) {
+		if (rVal >= 110) { return stringToImColor("0,255,0"); }
+		buf << (255 - round(((float)rVal - 60.0 - 20) * 10.2)) << ",255" << ",0";
+		return stringToImColor(buf.str());
+	}
+	else { return stringToImColor("0,0,0"); }
+}
+
 string OnTarget::ImColorToString(ImColor color)
 {
 	return to_string((int)(color.Value.x * 255)) + "," + to_string((int)(color.Value.y * 255)) + "," + to_string((int)(color.Value.z * 255));
 }
+
+void OnTarget::onNewAttempt(string eventName) {if(!gotEnd){ballResets++;}else{gotEnd = false;}}
+
 
 void OnTarget::onDestroyBall(string eventName)
 {
@@ -151,14 +179,15 @@ void OnTarget::onStartNewRound(string eventName)
 void OnTarget::clearShotsResetCounts(string eventName)
 {
 	shots.clear();
-
-	ballHit = 0, ballDestroyed = 0;
+	goalSpeeds.clear();
+	ballHit = 0, ballDestroyed = 0; ballResets = 0; averageBuffer = 0;
 }
 
 void OnTarget::onHitGoal(BallWrapper ball, void* params, string eventName)
 {
 	if (!ball.IsNull()) {
 		Vector hitGoalBallLocation = ball.GetLocation();
+		Vector hitGoalBallVel = ball.GetVelocity();
 
 		if ((hitGoalBallLocation.Z > 93.f && hitGoalBallLocation.Z < 2044.f) && (hitGoalBallLocation.X > -4096.f && hitGoalBallLocation.X < 4096.f)) {
 			ImVec2 location = flattenToPlane(hitGoalBallLocation);
@@ -175,8 +204,15 @@ void OnTarget::onHitGoal(BallWrapper ball, void* params, string eventName)
 
 				shots.back() = shot;
 			}
+			cvarManager->log(std::to_string((hitGoalBallVel.X)));
+			cvarManager->log(std::to_string((hitGoalBallVel.Y)));
+			cvarManager->log(std::to_string((hitGoalBallVel.Z)));
+			lastGoalSpeed = sqrt(pow(hitGoalBallVel.X,2) + pow(hitGoalBallVel.Y,2) + pow(hitGoalBallVel.Z,2)) / 27.778;
+			cvarManager->log(std::to_string(lastGoalSpeed));
+			goalSpeeds.push_back(lastGoalSpeed);
 
-			shots.push_back(Shot{ location, true , false });
+			shots.push_back(Shot{ location, true , false, lastGoalSpeed });
+			gotEnd = true;
 		}
 	}
 }
@@ -203,6 +239,7 @@ void OnTarget::onHitWorld(BallWrapper ball, void* params, string eventName)
 			}
 
 			shots.push_back(Shot{ location, false, false });
+			gotEnd = true;
 		}
 	}
 }
@@ -252,6 +289,7 @@ void OnTarget::RenderImGui()
 		ImGui::Begin((GetMenuTitle() + " - Settings").c_str(), &renderSettings, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
 
 		ImGui::Checkbox("Titlebar", &titleBar);
+		ImGui::Checkbox("Resetting shot counts as miss", &doesResetCountAsMiss);
 		ImGui::InputInt("Shot History", &shotHistory, 1, 16, ImGuiInputTextFlags_CharsNoBlank | ImGuiInputTextFlags_AutoSelectAll);
 		ImGui::SliderFloat("Transparency", &transparency, 0.f, 1.f, "%.2f");
 
@@ -319,7 +357,7 @@ void OnTarget::RenderImGui()
 
 	p = ImGui::GetCursorScreenPos();
 
-	if (shots.size() > 0) {
+	if (shots.size() > counter) {
 		float s = scale;
 
 		uint64_t attempts = 0, goals = 0;
@@ -334,7 +372,7 @@ void OnTarget::RenderImGui()
 					drawList->AddCircle(ImVec2(p.x + (wallWidth / 2) + shots.at(idx).location.x * (wallWidth / 2), p.y + wallHeight - shots.at(idx).location.y * wallHeight), 10.f * s, WHITE, 16, 7);
 				}
 
-				drawList->AddCircle(ImVec2(p.x + (wallWidth / 2) + shots.at(idx).location.x * (wallWidth / 2), p.y + wallHeight - shots.at(idx).location.y * wallHeight), 10.f * s, goalHitColor, 16, 3);
+				drawList->AddCircle(ImVec2(p.x + (wallWidth / 2) + shots.at(idx).location.x * (wallWidth / 2), p.y + wallHeight - shots.at(idx).location.y * wallHeight), 10.f * s, colorScale(shots.at(idx).speed), 16, 3);
 
 				attempts++;
 				goals++;
@@ -375,12 +413,19 @@ void OnTarget::RenderImGui()
 				attempts++;
 			}
 		}
+		if (doesResetCountAsMiss) { attempts += ballResets; }
 
 		float shootingPercentage = ((float)goals / (float)attempts * 100);
 
+		averageBuffer = 0;
+		for (auto& itr : goalSpeeds) { averageBuffer += itr; }
+		avgGoalSpeed = averageBuffer / (float)goals;
+		if (isnan(avgGoalSpeed)) { avgGoalSpeed = 0; }
+
 		ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + 16 * scale, ImGui::GetCursorPosY() + 12 * scale));
 
-		ImGui::Text("%i/%i (%.0f%%)", goals, attempts, shootingPercentage);
+		ImGui::Text("%i/%i (%.0f%%)\n%i resets\navg %.2f km/h", goals, attempts, shootingPercentage, ballResets, avgGoalSpeed);
+
 	}
 
 	ImGui::PopStyleVar();
